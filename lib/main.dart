@@ -1,122 +1,425 @@
+import 'dart:convert';
 import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter_riverpod/legacy.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
-void main() {
-  runApp(const MyApp());
+// ---------------------------------------------------------
+// MODEL
+// ---------------------------------------------------------
+class Todo {
+  final String id;
+  final String title;
+  final String? description;
+  final bool completed;
+  final DateTime createdAt;
+
+  Todo({
+    required this.id,
+    required this.title,
+    this.description,
+    this.completed = false,
+    DateTime? createdAt,
+  }) : createdAt = createdAt ?? DateTime.now();
+
+  Todo copyWith({
+    String? id,
+    String? title,
+    String? description,
+    bool? completed,
+    DateTime? createdAt,
+  }) {
+    return Todo(
+      id: id ?? this.id,
+      title: title ?? this.title,
+      description: description ?? this.description,
+      completed: completed ?? this.completed,
+      createdAt: createdAt ?? this.createdAt,
+    );
+  }
+
+  Map<String, dynamic> toMap() => {
+    'id': id,
+    'title': title,
+    'description': description,
+    'completed': completed,
+    'createdAt': createdAt.toIso8601String(),
+  };
+
+  factory Todo.fromMap(Map<String, dynamic> m) => Todo(
+    id: m['id'],
+    title: m['title'],
+    description: m['description'],
+    completed: m['completed'],
+    createdAt: DateTime.parse(m['createdAt']),
+  );
 }
 
-class MyApp extends StatelessWidget {
-  const MyApp({super.key});
+// ---------------------------------------------------------
+// REPOSITORY (LOCAL PERSISTENCE)
+// ---------------------------------------------------------
+class TodoRepository {
+  static const storageKey = 'TODOS';
+  final SharedPreferences prefs;
 
-  // This widget is the root of your application.
-  @override
-  Widget build(BuildContext context) {
-    return MaterialApp(
-      title: 'Flutter Demo',
-      theme: ThemeData(
-        // This is the theme of your application.
-        //
-        // TRY THIS: Try running your application with "flutter run". You'll see
-        // the application has a purple toolbar. Then, without quitting the app,
-        // try changing the seedColor in the colorScheme below to Colors.green
-        // and then invoke "hot reload" (save your changes or press the "hot
-        // reload" button in a Flutter-supported IDE, or press "r" if you used
-        // the command line to start the app).
-        //
-        // Notice that the counter didn't reset back to zero; the application
-        // state is not lost during the reload. To reset the state, use hot
-        // restart instead.
-        //
-        // This works for code too, not just values: Most code changes can be
-        // tested with just a hot reload.
-        colorScheme: ColorScheme.fromSeed(seedColor: Colors.deepPurple),
-      ),
-      home: const MyHomePage(title: 'Flutter Demo Home Page'),
+  TodoRepository(this.prefs);
+
+  List<Todo> load() {
+    final text = prefs.getString(storageKey);
+    if (text == null) return [];
+    final list = jsonDecode(text) as List;
+    return list.map((e) => Todo.fromMap(Map<String, dynamic>.from(e))).toList();
+  }
+
+  Future<void> save(List<Todo> items) async {
+    await prefs.setString(
+      storageKey,
+      jsonEncode(items.map((e) => e.toMap()).toList()),
     );
   }
 }
 
-class MyHomePage extends StatefulWidget {
-  const MyHomePage({super.key, required this.title});
+// Providers
+final sharedPrefsProvider = Provider<SharedPreferences>((ref) => throw UnimplementedError());
+final todoRepositoryProvider = Provider<TodoRepository>((ref) {
+  return TodoRepository(ref.watch(sharedPrefsProvider));
+});
 
-  // This widget is the home page of your application. It is stateful, meaning
-  // that it has a State object (defined below) that contains fields that affect
-  // how it looks.
+// ---------------------------------------------------------
+// STATE NOTIFIER (Riverpod 3)
+// ---------------------------------------------------------
+class TodoListNotifier extends StateNotifier<List<Todo>> {
+  final Ref ref;
+  TodoListNotifier(this.ref) : super([]) {
+    _load();
+  }
 
-  // This class is the configuration for the state. It holds the values (in this
-  // case the title) provided by the parent (in this case the App widget) and
-  // used by the build method of the State. Fields in a Widget subclass are
-  // always marked "final".
+  void _load() {
+    state = ref.read(todoRepositoryProvider).load();
+  }
 
-  final String title;
+  Future<void> _save() async => ref.read(todoRepositoryProvider).save(state);
 
-  @override
-  State<MyHomePage> createState() => _MyHomePageState();
+  Future<void> add(String title, String? description) async {
+    final item = Todo(
+      id: DateTime.now().millisecondsSinceEpoch.toString(),
+      title: title.trim(),
+      description: description?.trim().isEmpty == true ? null : description,
+    );
+    state = [item, ...state];
+    await _save();
+  }
+
+  Future<void> update(Todo todo) async {
+    state = [for (final t in state) if (t.id == todo.id) todo else t];
+    await _save();
+  }
+
+  Future<void> remove(String id) async {
+    state = state.where((e) => e.id != id).toList();
+    await _save();
+  }
+
+  Future<void> toggle(String id) async {
+    final t = state.firstWhere((e) => e.id == id);
+    update(t.copyWith(completed: !t.completed));
+  }
+
+  Future<void> reorder(int oldIndex, int newIndex) async {
+    final list = [...state];
+    if (newIndex > oldIndex) newIndex -= 1;
+    final item = list.removeAt(oldIndex);
+    list.insert(newIndex, item);
+    state = list;
+    await _save();
+  }
 }
 
-class _MyHomePageState extends State<MyHomePage> {
-  int _counter = 0;
+final todoListProvider = StateNotifierProvider<TodoListNotifier, List<Todo>>(
+      (ref) => TodoListNotifier(ref),
+);
 
-  void _incrementCounter() {
-    setState(() {
-      // This call to setState tells the Flutter framework that something has
-      // changed in this State, which causes it to rerun the build method below
-      // so that the display can reflect the updated values. If we changed
-      // _counter without calling setState(), then the build method would not be
-      // called again, and so nothing would appear to happen.
-      _counter++;
-    });
+// Filters
+enum TodoFilter { all, active, completed }
+final filterProvider = StateProvider<TodoFilter>((ref) => TodoFilter.all);
+final searchProvider = StateProvider<String>((ref) => "");
+
+final filteredTodosProvider = Provider<List<Todo>>((ref) {
+  final list = ref.watch(todoListProvider);
+  final filter = ref.watch(filterProvider);
+  final query = ref.watch(searchProvider).toLowerCase();
+
+  return list.where((t) {
+    if (filter == TodoFilter.active && t.completed) return false;
+    if (filter == TodoFilter.completed && !t.completed) return false;
+    if (query.isNotEmpty && !t.title.toLowerCase().contains(query)) return false;
+    return true;
+  }).toList();
+});
+
+// ---------------------------------------------------------
+// MAIN + UI
+// ---------------------------------------------------------
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  final prefs = await SharedPreferences.getInstance();
+
+  runApp(
+    ProviderScope(
+      overrides: [sharedPrefsProvider.overrideWithValue(prefs)],
+      child: const TodoApp(),
+    ),
+  );
+}
+
+class TodoApp extends StatelessWidget {
+  const TodoApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(useMaterial3: true, colorScheme: ColorScheme.fromSeed(seedColor: Colors.indigo)),
+      home: const TodoHomePage(),
+    );
+  }
+}
+
+class TodoHomePage extends ConsumerWidget {
+  const TodoHomePage({super.key});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final todos = ref.watch(filteredTodosProvider);
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text("Todo App"),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.search),
+            onPressed: () => showSearch(context: context, delegate: TodoSearchDelegate(ref)),
+          ),
+          IconButton(
+            icon: const Icon(Icons.filter_alt),
+            onPressed: () => _showFilterSheet(context, ref),
+          ),
+        ],
+      ),
+      floatingActionButton: FloatingActionButton.extended(
+        onPressed: () => _openForm(context, ref),
+        label: const Text("Add Todo"),
+        icon: const Icon(Icons.add),
+      ),
+      body: todos.isEmpty
+          ? const Center(child: Text("No todos yet."))
+          : ReorderableListView.builder(
+        itemCount: todos.length,
+        onReorder: (oldIndex, newIndex) => ref.read(todoListProvider.notifier).reorder(oldIndex, newIndex),
+        itemBuilder: (context, i) {
+          final t = todos[i];
+          return Dismissible(
+            key: ValueKey(t.id),
+            onDismissed: (_) => ref.read(todoListProvider.notifier).remove(t.id),
+            background: Container(color: Colors.red, child: const Icon(Icons.delete, color: Colors.white)),
+            child: ListTile(
+              leading: const Icon(Icons.drag_handle),
+              title: Text(t.title, style: TextStyle(decoration: t.completed ? TextDecoration.lineThrough : null)),
+              subtitle: t.description == null ? null : Text(t.description!),
+              trailing: Checkbox(
+                value: t.completed,
+                onChanged: (_) => ref.read(todoListProvider.notifier).toggle(t.id),
+              ),
+              onTap: () => _openForm(context, ref, todo: t),
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  void _showFilterSheet(BuildContext context, WidgetRef ref) {
+    showModalBottomSheet(
+      context: context,
+      builder: (_) => Consumer(builder: (context, ref, _) {
+        final filter = ref.watch(filterProvider);
+        return Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              title: const Text("All"),
+              trailing: filter == TodoFilter.all ? const Icon(Icons.check) : null,
+              onTap: () => ref.read(filterProvider.notifier).state = TodoFilter.all,
+            ),
+            ListTile(
+              title: const Text("Active"),
+              trailing: filter == TodoFilter.active ? const Icon(Icons.check) : null,
+              onTap: () => ref.read(filterProvider.notifier).state = TodoFilter.active,
+            ),
+            ListTile(
+              title: const Text("Completed"),
+              trailing: filter == TodoFilter.completed ? const Icon(Icons.check) : null,
+              onTap: () => ref.read(filterProvider.notifier).state = TodoFilter.completed,
+            ),
+          ],
+        );
+      }),
+    );
+  }
+
+  void _openForm(BuildContext context, WidgetRef ref, {Todo? todo}) {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      builder: (_) => TodoForm(todo: todo),
+    );
+  }
+}
+
+// ---------------------------------------------------------
+// FORM
+// ---------------------------------------------------------
+class TodoForm extends ConsumerStatefulWidget {
+  final Todo? todo;
+  const TodoForm({super.key, this.todo});
+
+  @override
+  ConsumerState<TodoForm> createState() => _TodoFormState();
+}
+
+class _TodoFormState extends ConsumerState<TodoForm> {
+  final _formKey = GlobalKey<FormState>();
+  late TextEditingController title;
+  late TextEditingController desc;
+  bool completed = false;
+
+  @override
+  void initState() {
+    super.initState();
+    title = TextEditingController(text: widget.todo?.title ?? "");
+    desc = TextEditingController(text: widget.todo?.description ?? "");
+    completed = widget.todo?.completed ?? false;
+  }
+
+  @override
+  void dispose() {
+    title.dispose();
+    desc.dispose();
+    super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    // This method is rerun every time setState is called, for instance as done
-    // by the _incrementCounter method above.
-    //
-    // The Flutter framework has been optimized to make rerunning build methods
-    // fast, so that you can just rebuild anything that needs updating rather
-    // than having to individually change instances of widgets.
-    return Scaffold(
-      appBar: AppBar(
-        // TRY THIS: Try changing the color here to a specific color (to
-        // Colors.amber, perhaps?) and trigger a hot reload to see the AppBar
-        // change color while the other colors stay the same.
-        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
-        // Here we take the value from the MyHomePage object that was created by
-        // the App.build method, and use it to set our appbar title.
-        title: Text(widget.title),
-      ),
-      body: Center(
-        // Center is a layout widget. It takes a single child and positions it
-        // in the middle of the parent.
-        child: Column(
-          // Column is also a layout widget. It takes a list of children and
-          // arranges them vertically. By default, it sizes itself to fit its
-          // children horizontally, and tries to be as tall as its parent.
-          //
-          // Column has various properties to control how it sizes itself and
-          // how it positions its children. Here we use mainAxisAlignment to
-          // center the children vertically; the main axis here is the vertical
-          // axis because Columns are vertical (the cross axis would be
-          // horizontal).
-          //
-          // TRY THIS: Invoke "debug painting" (choose the "Toggle Debug Paint"
-          // action in the IDE, or press "p" in the console), to see the
-          // wireframe for each widget.
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: <Widget>[
-            const Text('You have pushed the button this many times:'),
-            Text(
-              '$_counter',
-              style: Theme.of(context).textTheme.headlineMedium,
-            ),
-          ],
+    final isEdit = widget.todo != null;
+    return Padding(
+      padding: EdgeInsets.only(bottom: MediaQuery.of(context).viewInsets.bottom),
+      child: Container(
+        padding: const EdgeInsets.all(16),
+        child: Form(
+          key: _formKey,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(isEdit ? "Edit Todo" : "New Todo", style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+              const SizedBox(height: 16),
+              TextFormField(
+                controller: title,
+                decoration: const InputDecoration(labelText: "Title", border: OutlineInputBorder()),
+                validator: (v) => v!.isEmpty ? "Enter title" : null,
+              ),
+              const SizedBox(height: 12),
+              TextFormField(
+                controller: desc,
+                decoration: const InputDecoration(labelText: "Description", border: OutlineInputBorder()),
+                maxLines: 3,
+              ),
+              if (isEdit) ...[
+                const SizedBox(height: 12),
+                SwitchListTile(
+                  value: completed,
+                  onChanged: (v) => setState(() => completed = v),
+                  title: const Text("Completed"),
+                ),
+              ],
+              const SizedBox(height: 16),
+              ElevatedButton(
+                onPressed: () async {
+                  if (!_formKey.currentState!.validate()) return;
+
+                  if (widget.todo == null) {
+                    await ref.read(todoListProvider.notifier).add(title.text, desc.text);
+                  } else {
+                    await ref.read(todoListProvider.notifier).update(
+                      widget.todo!.copyWith(
+                        title: title.text,
+                        description: desc.text,
+                        completed: completed,
+                      ),
+                    );
+                  }
+
+                  if (mounted) Navigator.pop(context);
+                },
+                child: Text(isEdit ? "Save" : "Create"),
+              ),
+            ],
+          ),
         ),
       ),
-      floatingActionButton: FloatingActionButton(
-        onPressed: _incrementCounter,
-        tooltip: 'Increment',
-        child: const Icon(Icons.add),
-      ), // This trailing comma makes auto-formatting nicer for build methods.
+    );
+  }
+}
+
+// ---------------------------------------------------------
+// SEARCH
+// ---------------------------------------------------------
+class TodoSearchDelegate extends SearchDelegate {
+  final WidgetRef ref;
+  TodoSearchDelegate(this.ref) : super(searchFieldLabel: "Search todos");
+
+  @override
+  List<Widget>? buildActions(BuildContext context) => [
+    IconButton(onPressed: () => query = "", icon: const Icon(Icons.clear)),
+  ];
+
+  @override
+  Widget? buildLeading(BuildContext context) => IconButton(
+    icon: const Icon(Icons.arrow_back),
+    onPressed: () => close(context, null),
+  );
+
+  @override
+  Widget buildResults(BuildContext context) {
+    final items = ref.read(todoListProvider);
+    final results = items.where((t) => t.title.toLowerCase().contains(query.toLowerCase())).toList();
+
+    return ListView.builder(
+      itemCount: results.length,
+      itemBuilder: (_, i) {
+        final t = results[i];
+        return ListTile(
+          title: Text(t.title),
+          subtitle: t.description == null ? null : Text(t.description!),
+          onTap: () => close(context, t),
+        );
+      },
+    );
+  }
+
+  @override
+  Widget buildSuggestions(BuildContext context) {
+    final items = ref.read(todoListProvider);
+    final results = items.where((t) => t.title.toLowerCase().contains(query.toLowerCase())).toList();
+
+    return ListView.builder(
+      itemCount: results.length,
+      itemBuilder: (_, i) => ListTile(
+        title: Text(results[i].title),
+        onTap: () {
+          query = results[i].title;
+          showResults(context);
+        },
+      ),
     );
   }
 }
